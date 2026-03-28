@@ -110,7 +110,7 @@ target_link_libraries(llama-mtmd-debug PRIVATE common mtmd Threads::Threads)
 target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
 
 set(TARGET llama-vl-embedding)
-add_executable(${TARGET} ../../examples/embedding/vl-embedding.cpp)
+add_executable(${TARGET} vl-embedding.cpp)
 install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE common mtmd Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
