@@ -24,8 +24,14 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
+// Opaque CUDA stream hook for CUDA-compatible overlay backends.
+GGML_BACKEND_API void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
+GGML_BACKEND_API void * ggml_backend_cuda_get_device_stream(int device);
+GGML_BACKEND_API int    ggml_backend_cuda_get_stream_device(void * stream);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
+GGML_BACKEND_API int ggml_backend_cuda_get_buffer_type_device(ggml_backend_buffer_type_t buft);
 
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);

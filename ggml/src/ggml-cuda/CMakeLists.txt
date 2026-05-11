@@ -4,6 +4,9 @@ find_package(CUDAToolkit)
 
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
+    option(GGML_CUDA_TILELANG_INJECTION
+           "ggml: allow CUDA backend to call TileLang AOT kernels"
+           OFF)
 
     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         # native == GPUs available at build time
@@ -123,6 +126,29 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-bf16-bf16.cu)
     endif()
 
+    if (GGML_CUDA_TILELANG_INJECTION)
+        if (GGML_TILELANG)
+            message(FATAL_ERROR
+                "GGML_CUDA_TILELANG_INJECTION=ON must be used with GGML_TILELANG=OFF. "
+                "Use a separate build directory for the CUDA injection experiment.")
+        endif()
+        set(GGML_CUDA_TILELANG_AOT_DIR "${CMAKE_CURRENT_LIST_DIR}/../ggml-tilelang")
+        set(GGML_CUDA_TILELANG_AOT_SOURCES
+            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_f16_gemv.cu"
+            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_f16_gemv_launcher.cu"
+            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_q8_0_gemv.cu"
+            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_q8_0_gemv_launcher.cu"
+        )
+        foreach(GGML_CUDA_TILELANG_AOT_SOURCE IN LISTS GGML_CUDA_TILELANG_AOT_SOURCES)
+            if (NOT EXISTS "${GGML_CUDA_TILELANG_AOT_SOURCE}")
+                message(FATAL_ERROR
+                    "GGML_CUDA_TILELANG_INJECTION=ON but ${GGML_CUDA_TILELANG_AOT_SOURCE} is missing. "
+                    "Run ggml/src/ggml-tilelang/kernels/gen_kernels.py first.")
+            endif()
+        endforeach()
+        list(APPEND GGML_SOURCES_CUDA ${GGML_CUDA_TILELANG_AOT_SOURCES})
+    endif()
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
@@ -140,6 +166,10 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_FORCE_CUBLAS)
         add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
+    endif()
+
+    if (GGML_CUDA_TILELANG_INJECTION)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_TILELANG_INJECTION)
     endif()
 
     if (GGML_CUDA_NO_VMM)
