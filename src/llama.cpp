@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
@@ -33,6 +34,45 @@
 //
 // interface implementation
 //
+
+static void llama_setenv_default(const char * name, const char * value) {
+    const char * cur = std::getenv(name);
+    if (cur != nullptr && cur[0] != '\0') {
+        return;
+    }
+
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+static void llama_model_maybe_enable_tilelang_w8a8(const gguf_context * metadata, const std::string & fname) {
+    if (metadata == nullptr || fname.empty()) {
+        return;
+    }
+
+    const int auto_key = gguf_find_key(metadata, "tilelang.w8a8.auto_enable");
+    if (auto_key < 0 || !gguf_get_val_bool(metadata, auto_key)) {
+        return;
+    }
+
+    llama_setenv_default("GGML_TILELANG_W8A8_ENABLE", "1");
+    llama_setenv_default("GGML_TILELANG_W8A8_PRELOAD", "1");
+    llama_setenv_default("GGML_TILELANG_W8A8_GGUF", fname.c_str());
+
+    const int ffn_graph_key = gguf_find_key(metadata, "tilelang.qwen35.ffn_graph.auto_enable");
+    if (ffn_graph_key >= 0 && gguf_get_val_bool(metadata, ffn_graph_key)) {
+        llama_setenv_default("GGML_TILELANG_QWEN35_FFN_GRAPH", "1");
+    }
+
+    const int ffn_graph_decode_key = gguf_find_key(metadata, "tilelang.qwen35.ffn_graph.decode");
+    if (ffn_graph_decode_key >= 0 && gguf_get_val_bool(metadata, ffn_graph_decode_key)) {
+        llama_setenv_default("GGML_TILELANG_QWEN35_FFN_GRAPH_DECODE", "1");
+    }
+
+}
 
 const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type) {
     switch (flash_attn_type) {
@@ -279,6 +319,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
             params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
+        llama_model_maybe_enable_tilelang_w8a8(ml.metadata, fname);
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 
@@ -575,4 +616,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

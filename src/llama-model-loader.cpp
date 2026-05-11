@@ -17,6 +17,44 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+static bool llama_model_loader_is_tilelang_w8a8_aux_tensor(const std::string & name) {
+    static const char prefix[] = "__tlw8a8.";
+    return name.rfind(prefix, 0) == 0;
+}
+
+static bool llama_model_loader_has_tilelang_w8a8_aux_tensors(const gguf_context * metadata) {
+    return metadata != nullptr && gguf_find_key(metadata, "tilelang.w8a8.version") >= 0;
+}
+
+static bool llama_model_loader_is_tilelang_w8a8_replacement_tensor(const gguf_context * metadata, const std::string & name) {
+    if (metadata == nullptr) {
+        return false;
+    }
+
+    const int storage_key = gguf_find_key(metadata, "tilelang.w8a8.storage");
+    if (storage_key < 0) {
+        return false;
+    }
+
+    const char * storage = gguf_get_val_str(metadata, storage_key);
+    if (storage == nullptr || std::strcmp(storage, "gguf_replacement_tensors") != 0) {
+        return false;
+    }
+
+    const int manifest_key = gguf_find_key(metadata, "tilelang.w8a8.manifest");
+    if (manifest_key < 0) {
+        return false;
+    }
+
+    const char * manifest = gguf_get_val_str(metadata, manifest_key);
+    if (manifest == nullptr) {
+        return false;
+    }
+
+    const std::string needle = "\"name\":\"" + name + "\"";
+    return std::strstr(manifest, needle.c_str()) != nullptr;
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -577,8 +615,10 @@ llama_model_loader::llama_model_loader(
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
             }
-            n_elements += ggml_nelements(cur);
-            n_bytes    += ggml_nbytes(cur);
+            if (!llama_model_loader_is_tilelang_w8a8_aux_tensor(tensor_name)) {
+                n_elements += ggml_nelements(cur);
+                n_bytes    += ggml_nbytes(cur);
+            }
             weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
         }
         uint16_t n_split = 0;
@@ -643,8 +683,10 @@ llama_model_loader::llama_model_loader(
                     if (weights_map.find(tensor_name) != weights_map.end()) {
                         throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
                     }
-                    n_elements += ggml_nelements(cur);
-                    n_bytes    += ggml_nbytes(cur);
+                    if (!llama_model_loader_is_tilelang_w8a8_aux_tensor(tensor_name)) {
+                        n_elements += ggml_nelements(cur);
+                        n_bytes    += ggml_nbytes(cur);
+                    }
                     weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
                 }
             }
@@ -687,8 +729,10 @@ llama_model_loader::llama_model_loader(
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
             }
-            n_elements += ggml_nelements(cur);
-            n_bytes    += ggml_nbytes(cur);
+            if (!llama_model_loader_is_tilelang_w8a8_aux_tensor(tensor_name)) {
+                n_elements += ggml_nelements(cur);
+                n_bytes    += ggml_nbytes(cur);
+            }
             weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
         }
     } else {
@@ -713,6 +757,9 @@ llama_model_loader::llama_model_loader(
         enum ggml_type type_max = GGML_TYPE_F32;
 
         for (const auto & it : weights_map) {
+            if (llama_model_loader_is_tilelang_w8a8_aux_tensor(it.first)) {
+                continue;
+            }
             const llama_tensor_weight & w = it.second;
             const ggml_tensor * tensor = w.tensor;
 
@@ -1150,6 +1197,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
         }
 
+        if (t_meta->type == GGML_TYPE_I8 && llama_model_loader_is_tilelang_w8a8_replacement_tensor(metadata, tn.str())) {
+            return buft_list->front().second;
+        }
+
         ggml_backend_buffer_type_t buft = nullptr;
 
         // check overrides
@@ -1313,8 +1364,20 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 }
 
 void llama_model_loader::done_getting_tensors() const {
-    if (n_created != n_tensors) {
+    int n_tilelang_w8a8_aux = 0;
+    if (llama_model_loader_has_tilelang_w8a8_aux_tensors(metadata)) {
+        for (const auto & it : weights_map) {
+            if (llama_model_loader_is_tilelang_w8a8_aux_tensor(it.first)) {
+                n_tilelang_w8a8_aux++;
+            }
+        }
+    }
+
+    if (n_created + n_tilelang_w8a8_aux != n_tensors) {
         throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+    }
+    if (n_tilelang_w8a8_aux > 0) {
+        LLAMA_LOG_INFO("%s: ignoring %d TileLang W8A8 auxiliary tensors\n", __func__, n_tilelang_w8a8_aux);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",

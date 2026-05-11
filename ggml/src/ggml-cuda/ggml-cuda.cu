@@ -86,25 +86,11 @@
 #include <string>
 #include <vector>
 
-static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
-
 #ifdef GGML_CUDA_TILELANG_INJECTION
-extern "C" void tilelang_f16_gemv(
-    const void * w_f16,
-    const float * x_f32,
-    float * y_f32,
-    int K,
-    int N,
-    void * stream);
-
-extern "C" void tilelang_q8_0_gemv(
-    const void * w_q8_0,
-    const float * x_f32,
-    float * y_f32,
-    int K,
-    int N,
-    void * stream);
+#include "../ggml-tilelang/tilelang-cuda-injection.h"
 #endif
+
+static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
@@ -2567,119 +2553,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-#ifdef GGML_CUDA_TILELANG_INJECTION
-static std::atomic<size_t> g_cuda_tilelang_mul_mat_f16_calls{0};
-static std::atomic<size_t> g_cuda_tilelang_mul_mat_q8_0_calls{0};
-
-static bool ggml_cuda_tilelang_injection_enabled() {
-    const char * env = std::getenv("GGML_TILELANG_ENABLE");
-    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
-}
-
-static bool ggml_cuda_tilelang_tensor_on_device(const ggml_tensor * tensor, int device) {
-    if (tensor == nullptr || tensor->buffer == nullptr || tensor->buffer->buft == nullptr) {
-        return false;
-    }
-
-    if (!ggml_backend_buft_is_cuda(tensor->buffer->buft)) {
-        return false;
-    }
-
-    ggml_backend_cuda_buffer_type_context * buft_ctx =
-        (ggml_backend_cuda_buffer_type_context *) tensor->buffer->buft->context;
-    return buft_ctx->device == device;
-}
-
-static bool ggml_cuda_tilelang_supports_mul_mat_gemv(
-        ggml_backend_cuda_context & ctx,
-        const ggml_tensor * src0,
-        const ggml_tensor * src1,
-        const ggml_tensor * dst) {
-    if (!ggml_cuda_tilelang_injection_enabled()) {
-        return false;
-    }
-
-    if (src0 == nullptr || src1 == nullptr || dst == nullptr) {
-        return false;
-    }
-
-    if (!ggml_cuda_tilelang_tensor_on_device(src0, ctx.device) ||
-        !ggml_cuda_tilelang_tensor_on_device(src1, ctx.device) ||
-        !ggml_cuda_tilelang_tensor_on_device(dst,  ctx.device)) {
-        return false;
-    }
-
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        return false;
-    }
-
-    if (src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_Q8_0) {
-        return false;
-    }
-
-    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
-        return false;
-    }
-
-    const int64_t K = src0->ne[0];
-    const int64_t N = src0->ne[1];
-
-    if (K <= 0 || N <= 0 ||
-        K > (int64_t) std::numeric_limits<int>::max() ||
-        N > (int64_t) std::numeric_limits<int>::max()) {
-        return false;
-    }
-
-    if (src0->type == GGML_TYPE_Q8_0 && K % QK8_0 != 0) {
-        return false;
-    }
-
-    if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
-        src1->ne[0] != K || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
-        dst->ne[0]  != N || dst->ne[1]  != 1 || dst->ne[2]  != 1 || dst->ne[3]  != 1) {
-        return false;
-    }
-
-    return true;
-}
-
-static bool ggml_cuda_tilelang_try_mul_mat(
-        ggml_backend_cuda_context & ctx,
-        const ggml_tensor * src0,
-        const ggml_tensor * src1,
-        ggml_tensor * dst) {
-    if (!ggml_cuda_tilelang_supports_mul_mat_gemv(ctx, src0, src1, dst)) {
-        return false;
-    }
-
-    static std::once_flag once;
-    std::call_once(once, [] {
-        GGML_LOG_INFO("ggml-cuda: TileLang injection enabled for F16/Q8_0 GEMV\n");
-    });
-
-    const int K = (int) src0->ne[0];
-    const int N = (int) src0->ne[1];
-    cudaStream_t stream = ctx.stream();
-
-    if (src0->type == GGML_TYPE_F16) {
-        g_cuda_tilelang_mul_mat_f16_calls++;
-        tilelang_f16_gemv(src0->data, (const float *) src1->data, (float *) dst->data, K, N, stream);
-    } else {
-        g_cuda_tilelang_mul_mat_q8_0_calls++;
-        tilelang_q8_0_gemv(src0->data, (const float *) src1->data, (float *) dst->data, K, N, stream);
-    }
-
-    return true;
-}
-#endif
-
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-#ifdef GGML_CUDA_TILELANG_INJECTION
-    if (ggml_cuda_tilelang_try_mul_mat(ctx, src0, src1, dst)) {
-        return;
-    }
-#endif
-
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -3249,6 +3123,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;
+        case GGML_OP_CUSTOM:
+#ifdef GGML_CUDA_TILELANG_INJECTION
+            if (ggml_tilelang_cuda_try_custom(ctx.device, ctx.stream(), dst)) {
+                break;
+            }
+#endif
+            return false;
         default:
             return false;
     }
@@ -3276,12 +3157,7 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
 #ifdef GGML_CUDA_TILELANG_INJECTION
-    const size_t n_tilelang_f16  = g_cuda_tilelang_mul_mat_f16_calls.load();
-    const size_t n_tilelang_q8_0 = g_cuda_tilelang_mul_mat_q8_0_calls.load();
-    if (n_tilelang_f16 > 0 || n_tilelang_q8_0 > 0 || ggml_cuda_tilelang_injection_enabled()) {
-        GGML_LOG_INFO("ggml-cuda: TileLang injection MUL_MAT_F16 calls = %zu\n", n_tilelang_f16);
-        GGML_LOG_INFO("ggml-cuda: TileLang injection MUL_MAT_Q8_0 calls = %zu\n", n_tilelang_q8_0);
-    }
+    ggml_tilelang_cuda_release_device(cuda_ctx->device);
 #endif
 
     ggml_backend_cuda_unregister_stream_context(cuda_ctx);
@@ -5592,6 +5468,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
+        case GGML_OP_CUSTOM:
+#ifdef GGML_CUDA_TILELANG_INJECTION
+            return ggml_tilelang_cuda_supports_op(op);
+#else
+            return false;
+#endif
 
         default:
             return false;
@@ -5859,6 +5741,10 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     };
 
     ggml_backend_cuda_register_stream_context(ctx);
+
+#ifdef GGML_CUDA_TILELANG_INJECTION
+    (void) ggml_tilelang_cuda_preload_device(device);
+#endif
 
     return cuda_backend;
 }

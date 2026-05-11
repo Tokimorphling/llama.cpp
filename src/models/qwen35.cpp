@@ -1,6 +1,50 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+
+static bool qwen35_tilelang_ffn_graph_enabled() {
+    const char * env = std::getenv("GGML_TILELANG_QWEN35_FFN_GRAPH");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static bool qwen35_tilelang_ffn_graph_decode_enabled() {
+    const char * env = std::getenv("GGML_TILELANG_QWEN35_FFN_GRAPH_DECODE");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static constexpr uintptr_t QWEN35_TILELANG_FFN_MAGIC = 0x51333546u;
+
+static void qwen35_tilelang_ffn_cpu_abort(ggml_tensor *, int, int, void *) {
+    GGML_ABORT("Qwen3.5 TileLang FFN graph node requires CUDA TileLang injection");
+}
+
+static ggml_tensor * qwen35_tilelang_ffn(
+        ggml_context * ctx,
+        ggml_tensor  * x,
+        ggml_tensor  * up,
+        ggml_tensor  * gate,
+        ggml_tensor  * down) {
+    ggml_tensor * args[] = { x, up, gate, down };
+
+    ggml_tensor * result = ggml_custom_4d(
+            ctx,
+            GGML_TYPE_F32,
+            down->ne[1],
+            x->ne[1],
+            1,
+            1,
+            args,
+            4,
+            qwen35_tilelang_ffn_cpu_abort,
+            0,
+            reinterpret_cast<void *>(QWEN35_TILELANG_FFN_MAGIC));
+    ggml_set_name(result, "tl_qwen35_ffn");
+    return result;
+}
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -114,12 +158,12 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
+        // Determine layer type and build appropriate attention mechanism
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
         ggml_build_forward_expand(gf, cur);
 
-        // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recurrent(il)) {
             // Linear attention layer (gated delta net)
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
@@ -460,6 +504,22 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     // Qwen3.5 does not use MoE FFN
     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
+
+    if (qwen35_tilelang_ffn_graph_enabled() &&
+        (ubatch.n_tokens > 1 || qwen35_tilelang_ffn_graph_decode_enabled()) &&
+        (loras == nullptr || loras->empty()) &&
+        model.layers[il].ffn_up_s == nullptr &&
+        model.layers[il].ffn_gate_s == nullptr &&
+        model.layers[il].ffn_down_s == nullptr) {
+        cur = qwen35_tilelang_ffn(
+            ctx0,
+            cur,
+            model.layers[il].ffn_up,
+            model.layers[il].ffn_gate,
+            model.layers[il].ffn_down);
+        cb(cur, "tl_qwen35_ffn", il);
+        return cur;
+    }
 
     cur = build_ffn(cur,
         model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,

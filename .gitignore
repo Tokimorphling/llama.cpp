@@ -55,6 +55,10 @@
 /autogen-*.md
 /common/build-info.cpp
 
+# TileLang generated kernels
+/ggml/src/ggml-tilelang/generated/*
+!/ggml/src/ggml-tilelang/generated/.gitkeep
+
 # Deprecated
 
 /main

@@ -127,25 +127,50 @@ if (CUDAToolkit_FOUND)
     endif()
 
     if (GGML_CUDA_TILELANG_INJECTION)
-        if (GGML_TILELANG)
-            message(FATAL_ERROR
-                "GGML_CUDA_TILELANG_INJECTION=ON must be used with GGML_TILELANG=OFF. "
-                "Use a separate build directory for the CUDA injection experiment.")
-        endif()
         set(GGML_CUDA_TILELANG_AOT_DIR "${CMAKE_CURRENT_LIST_DIR}/../ggml-tilelang")
-        set(GGML_CUDA_TILELANG_AOT_SOURCES
-            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_f16_gemv.cu"
-            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_f16_gemv_launcher.cu"
-            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_q8_0_gemv.cu"
-            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_q8_0_gemv_launcher.cu"
+        set(GGML_CUDA_TILELANG_GENERATED_SOURCES
+            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_w8a8_gemv.cu"
+            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_w8a8_gemv_launcher.cu"
+            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_w8a8_gemm.cu"
+            "${GGML_CUDA_TILELANG_AOT_DIR}/generated/tilelang_w8a8_gemm_launcher.cu"
         )
-        foreach(GGML_CUDA_TILELANG_AOT_SOURCE IN LISTS GGML_CUDA_TILELANG_AOT_SOURCES)
-            if (NOT EXISTS "${GGML_CUDA_TILELANG_AOT_SOURCE}")
-                message(FATAL_ERROR
-                    "GGML_CUDA_TILELANG_INJECTION=ON but ${GGML_CUDA_TILELANG_AOT_SOURCE} is missing. "
-                    "Run ggml/src/ggml-tilelang/kernels/gen_kernels.py first.")
-            endif()
-        endforeach()
+        set(GGML_CUDA_TILELANG_AOT_SOURCES
+            ${GGML_CUDA_TILELANG_GENERATED_SOURCES}
+            "${GGML_CUDA_TILELANG_AOT_DIR}/tilelang-cuda-injection.cu"
+        )
+        file(GLOB GGML_CUDA_TILELANG_KERNEL_GENERATOR_FILES CONFIGURE_DEPENDS
+            "${GGML_CUDA_TILELANG_AOT_DIR}/kernels/*.py"
+            "${GGML_CUDA_TILELANG_AOT_DIR}/kernels/ops/*.py"
+        )
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c
+                    "import pathlib, tilelang; print(pathlib.Path(tilelang.__file__).resolve().parent / 'src')"
+            OUTPUT_VARIABLE GGML_CUDA_TILELANG_PYTHON_SRC_DIR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE GGML_CUDA_TILELANG_PYTHON_SRC_RESULT
+        )
+        if (NOT GGML_CUDA_TILELANG_PYTHON_SRC_RESULT EQUAL 0 OR
+            NOT EXISTS "${GGML_CUDA_TILELANG_PYTHON_SRC_DIR}/tl_templates")
+            message(FATAL_ERROR "GGML_CUDA_TILELANG_INJECTION=ON requires TileLang tl_templates headers")
+        endif()
+        get_filename_component(GGML_CUDA_TILELANG_PYTHON_ROOT_DIR "${GGML_CUDA_TILELANG_PYTHON_SRC_DIR}" DIRECTORY)
+        set(GGML_CUDA_TILELANG_CUTLASS_INCLUDE_DIR "${GGML_CUDA_TILELANG_PYTHON_ROOT_DIR}/3rdparty/cutlass/include")
+        add_custom_command(
+            OUTPUT ${GGML_CUDA_TILELANG_GENERATED_SOURCES}
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${GGML_CUDA_TILELANG_AOT_DIR}/generated"
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${GGML_CUDA_TILELANG_AOT_DIR}/kernels/gen_kernels.py"
+                    --target cuda
+                    --kernels w8a8_gemv,w8a8_gemm
+                    --out "${GGML_CUDA_TILELANG_AOT_DIR}/generated"
+            DEPENDS ${GGML_CUDA_TILELANG_KERNEL_GENERATOR_FILES}
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            COMMENT "Generating TileLang W8A8 CUDA injection kernels"
+            VERBATIM
+        )
+        set_source_files_properties(${GGML_CUDA_TILELANG_GENERATED_SOURCES} PROPERTIES GENERATED TRUE)
+        add_custom_target(ggml-cuda-tilelang-generate-kernels DEPENDS ${GGML_CUDA_TILELANG_GENERATED_SOURCES})
         list(APPEND GGML_SOURCES_CUDA ${GGML_CUDA_TILELANG_AOT_SOURCES})
     endif()
 
@@ -169,7 +194,17 @@ if (CUDAToolkit_FOUND)
     endif()
 
     if (GGML_CUDA_TILELANG_INJECTION)
-        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_TILELANG_INJECTION)
+        add_dependencies(ggml-cuda ggml-cuda-tilelang-generate-kernels)
+        set_property(SOURCE ggml-cuda.cu APPEND PROPERTY
+            COMPILE_DEFINITIONS GGML_CUDA_TILELANG_INJECTION)
+        set_property(SOURCE ${GGML_CUDA_TILELANG_AOT_SOURCES} APPEND PROPERTY
+            INCLUDE_DIRECTORIES
+                "${CMAKE_SOURCE_DIR}/vendor"
+                "${GGML_CUDA_TILELANG_PYTHON_SRC_DIR}"
+                "${GGML_CUDA_TILELANG_CUTLASS_INCLUDE_DIR}")
+        if (NOT EXISTS "${GGML_CUDA_TILELANG_CUTLASS_INCLUDE_DIR}/cute")
+            message(FATAL_ERROR "GGML_CUDA_TILELANG_INJECTION=ON requires TileLang CUTLASS/CuTe headers")
+        endif()
     endif()
 
     if (GGML_CUDA_NO_VMM)
